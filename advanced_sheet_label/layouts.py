@@ -78,6 +78,52 @@ PAPER_SIZES = {
 }
 
 LAYOUTS = {
+    # ------------------------------------------------------------------
+    # Avery US Letter label sheets
+    # ------------------------------------------------------------------
+
+    "5163": SheetLayout(
+        display_name="Avery 5163 (2 x 4 in, 10 per sheet)",
+        page_size=PAPER_SIZES["Letter"],
+        label_width=101.6,          # 4.000 in
+        label_height=50.8,          # 2.000 in
+        columns=2,
+        rows=5,
+        column_spacing=4.7625,      # 0.1875 in
+        row_spacing=0.0,
+        corner_radius=3.175,        # 0.125 in
+        spacing_top=12.7,           # 0.500 in
+        spacing_left=3.96875,       # 0.15625 in
+    ),
+
+    "94220": SheetLayout(
+        display_name="Avery Presta 94220 (1 x 2 in, 24 per sheet)",
+        page_size=PAPER_SIZES["Letter"],
+        label_width=50.8,           # 2.000 in
+        label_height=25.4,          # 1.000 in
+        columns=3,
+        rows=8,
+        column_spacing=15.875,      # 0.625 in
+        row_spacing=6.35,           # 0.250 in
+        corner_radius=3.175,        # rounded rectangle
+        spacing_top=15.875,         # 0.625 in
+        spacing_left=15.875,        # 0.625 in
+    ),
+
+    "22806": SheetLayout(
+        display_name="Avery 22806 (2 x 2 in, 12 per sheet)",
+        page_size=PAPER_SIZES["Letter"],
+        label_width=50.8,           # 2.000 in
+        label_height=50.8,          # 2.000 in
+        columns=3,
+        rows=4,
+        column_spacing=15.875,      # 0.625 in
+        row_spacing=15.24,          # 0.600 in
+        corner_radius=3.175,        # rounded square
+        spacing_top=15.24,          # 0.600 in
+        spacing_left=15.875,        # 0.625 in
+    ),
+
     "8160": SheetLayout(
         display_name="8160",
         page_size=PAPER_SIZES["Letter"],
