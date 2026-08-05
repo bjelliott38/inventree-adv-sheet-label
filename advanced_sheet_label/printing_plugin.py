@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -27,6 +28,46 @@ from .layouts import SheetLayout, LAYOUTS, LAYOUT_SELECT_OPTIONS
 _log = logging.getLogger('inventree-adv-sheet-label')
 #_log.setLevel(logging.DEBUG)
 _plugin_instance: "AdvancedLabelSheetPlugin" = ...
+
+
+def clean_embedded_label_html(html: str) -> str:
+    """Remove page-level CSS from a label before embedding it in a sheet.
+
+    InvenTree label templates are normally rendered as complete, standalone
+    pages. When their HTML is inserted into a larger label sheet, global
+    ``@page``, ``html`` and ``body`` rules can override the sheet page size or
+    clip the sheet to a single label. Page-break declarations can also force
+    every embedded label onto a separate PDF page.
+    """
+
+    # Remove any @page rule supplied by the individual label template.
+    html = re.sub(
+        r"@page\s*(?:[^{]*)\{[^{}]*\}",
+        "",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove global html/body CSS rules from the embedded label. These rules
+    # otherwise apply to the outer sheet document, not just to this label.
+    html = re.sub(
+        r"(?<![-\w.])(?:html\s*,\s*body|body\s*,\s*html|html|body)\s*\{[^{}]*\}",
+        "",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove forced page breaks from remaining rules such as .content.
+    html = re.sub(
+        r"(?:page-break-before|page-break-after|break-before|break-after)"
+        r"\s*:\s*[^;}{]+;?",
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    return html
+
 
 
 def get_default_layout() -> str:
@@ -338,6 +379,7 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                         cell = label.render_as_string(
                             items[idx], request, insert_page_style=False
                         )
+                        cell = clean_embedded_label_html(cell)
                         html += cell
                     except Exception as exc:
                         _log.exception('Error rendering label: %s', str(exc))
