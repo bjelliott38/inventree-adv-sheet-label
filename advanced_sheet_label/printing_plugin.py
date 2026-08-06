@@ -465,6 +465,30 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         </head>
         <body>
             {inner}
+
+            <!-- Keep this final style block after all embedded label HTML.
+                 Individual label templates can contain their own @page rule;
+                 the last @page rule wins in WeasyPrint. -->
+            <style>
+                @page {{
+                    size: {sheet_layout.page_size.width}mm {sheet_layout.page_size.height}mm;
+                    margin: 0mm;
+                    padding: 0mm;
+                }}
+
+                html,
+                body {{
+                    width: {sheet_layout.page_size.width}mm !important;
+                    min-width: {sheet_layout.page_size.width}mm !important;
+                    max-width: {sheet_layout.page_size.width}mm !important;
+                    height: auto !important;
+                    min-height: {sheet_layout.page_size.height}mm !important;
+                    max-height: none !important;
+                    margin: 0mm !important;
+                    padding: 0mm !important;
+                    overflow: visible !important;
+                }}
+            </style>
         </body>
         </html>
         """
