@@ -342,40 +342,26 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         return data
 
     def print_page(self, label: LabelTemplate, items: list, request, sheet_layout: SheetLayout):
-        """Generate a single page of labels.
+        """Generate a single page of labels using positioned DIV elements."""
 
-        For a single page, generate a table grid of labels.
-        Styling of the table is handled by the higher level label template
-
-        Arguments:
-            label: The LabelTemplate object to use for printing
-            items: The list of database items to print (e.g. StockItem instances)
-            request: The HTTP request object which triggered this print job
-            sheet_layout: the layout information of a page
-        """
-
-        # Generate a table of labels
-        html = """<table class='label-sheet-table'>"""
+        html = "<div class='label-sheet-page'>"
 
         for row in range(sheet_layout.rows):
-            html += "<tr class='label-sheet-row'>"
-
             for col in range(sheet_layout.columns):
-                # Cell index
                 idx = row * sheet_layout.columns + col
 
                 if idx >= len(items):
                     break
 
-                html += f"<td class='label-sheet-cell label-sheet-row-{row} label-sheet-col-{col}'>"
+                html += (
+                    f"<div class='label-sheet-cell "
+                    f"label-sheet-row-{row} label-sheet-col-{col}'>"
+                )
 
-                # If the label is empty (skipped), render an empty cell
                 if items[idx] is None:
-                    html += """<div class='label-sheet-cell-skip'></div>"""
+                    html += "<div class='label-sheet-cell-skip'></div>"
                 else:
                     try:
-                        # Render the individual label template
-                        # Note that we disable @page styling for this
                         cell = label.render_as_string(
                             items[idx], request, insert_page_style=False
                         )
@@ -383,20 +369,14 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                         html += cell
                     except Exception as exc:
                         _log.exception('Error rendering label: %s', str(exc))
-                        html += """
-                        <div class='label-sheet-cell-error'></div>
-                        """
-                
-                # overlay for border
+                        html += "<div class='label-sheet-cell-error'></div>"
+
                 html += "<div class='label-sheet-cell-overlay'></div>"
+                html += "</div>"
 
-                html += '</td>'
-
-            html += '</tr>'
-
-        html += '</table>'
-
+        html += "</div>"
         return html
+
 
     def wrap_pages(self, pages, enable_border: bool, fill_color: str, sheet_layout: SheetLayout):
         """Wrap the generated pages into a single document."""
@@ -435,11 +415,18 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                     padding: 0mm;
                 }}
 
-                .label-sheet-table {{
-                    page-break-after: always;
-                    table-layout: fixed;
+                .label-sheet-page {{
+                    position: relative;
                     width: {sheet_layout.page_size.width}mm;
-                    border-spacing: 0mm 0mm;
+                    height: {sheet_layout.page_size.height}mm;
+                    margin: 0mm;
+                    padding: 0mm;
+                    page-break-after: always;
+                    overflow: hidden;
+                }}
+
+                .label-sheet-page:last-child {{
+                    page-break-after: auto;
                 }}
 
                 .label-sheet-cell-error {{
@@ -447,10 +434,12 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                 }}
 
                 .label-sheet-cell {{
+                    position: absolute;
                     width: {sheet_layout.label_width}mm;
                     height: {sheet_layout.label_height}mm;
+                    margin: 0mm;
                     padding: 0mm;
-                    position: absolute;
+                    overflow: hidden;
                     {'background-color: ' + fill_color + ';' if fill_color not in ["", "unset"] else ''};
                     border-radius: {sheet_layout.corner_radius}mm;
                 }}
