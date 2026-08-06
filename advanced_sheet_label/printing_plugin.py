@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
-import re
+from pathlib import Path
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -28,46 +28,6 @@ from .layouts import SheetLayout, LAYOUTS, LAYOUT_SELECT_OPTIONS
 _log = logging.getLogger('inventree-adv-sheet-label')
 #_log.setLevel(logging.DEBUG)
 _plugin_instance: "AdvancedLabelSheetPlugin" = ...
-
-
-def clean_embedded_label_html(html: str) -> str:
-    """Remove page-level CSS from a label before embedding it in a sheet.
-
-    InvenTree label templates are normally rendered as complete, standalone
-    pages. When their HTML is inserted into a larger label sheet, global
-    ``@page``, ``html`` and ``body`` rules can override the sheet page size or
-    clip the sheet to a single label. Page-break declarations can also force
-    every embedded label onto a separate PDF page.
-    """
-
-    # Remove any @page rule supplied by the individual label template.
-    html = re.sub(
-        r"@page\s*(?:[^{]*)\{[^{}]*\}",
-        "",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # Remove global html/body CSS rules from the embedded label. These rules
-    # otherwise apply to the outer sheet document, not just to this label.
-    html = re.sub(
-        r"(?<![-\w.])(?:html\s*,\s*body|body\s*,\s*html|html|body)\s*\{[^{}]*\}",
-        "",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # Remove forced page breaks from remaining rules such as .content.
-    html = re.sub(
-        r"(?:page-break-before|page-break-after|break-before|break-after)"
-        r"\s*:\s*[^;}{]+;?",
-        "",
-        html,
-        flags=re.IGNORECASE,
-    )
-
-    return html
-
 
 
 def get_default_layout() -> str:
@@ -319,10 +279,27 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
 
         # generate all pages
         pages = []
+
+        # Debug output directory is inside the persistent InvenTree data volume.
+        debug_dir = Path("/home/inventree/data/plugin_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale files from the previous print attempt.
+        for old_debug_file in debug_dir.glob("sheet_label_*"):
+            try:
+                old_debug_file.unlink()
+            except OSError:
+                pass
+
         idx = 0
         while idx < len(items):
             if page := self.print_page(
-                label, items[idx : idx + sheet_layout.cells], request, sheet_layout
+                label,
+                items[idx : idx + sheet_layout.cells],
+                request,
+                sheet_layout,
+                debug_dir=debug_dir,
+                page_number=(idx // sheet_layout.cells) + 1,
             ):
                 pages.append(page)
 
@@ -334,6 +311,12 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         # render to a single HTML document
         html_data = self.wrap_pages(pages, border, fill_color, sheet_layout)
 
+        # Save the complete assembled sheet HTML for troubleshooting.
+        (debug_dir / "sheet_label_complete_sheet.html").write_text(
+            html_data,
+            encoding="utf-8",
+        )
+
         # render HTML to PDF
         html = weasyprint.HTML(string=html_data)
         data = html.render().write_pdf()
@@ -341,42 +324,79 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
             raise RuntimeError("Label PDF generation failed")
         return data
 
-    def print_page(self, label: LabelTemplate, items: list, request, sheet_layout: SheetLayout):
-        """Generate a single page of labels using positioned DIV elements."""
+    def print_page(
+        self,
+        label: LabelTemplate,
+        items: list,
+        request,
+        sheet_layout: SheetLayout,
+        debug_dir: Path | None = None,
+        page_number: int = 1,
+    ):
+        """Generate a single page of labels.
 
-        html = "<div class='label-sheet-page'>"
+        For a single page, generate a table grid of labels.
+        Styling of the table is handled by the higher level label template
+
+        Arguments:
+            label: The LabelTemplate object to use for printing
+            items: The list of database items to print (e.g. StockItem instances)
+            request: The HTTP request object which triggered this print job
+            sheet_layout: the layout information of a page
+        """
+
+        # Generate a table of labels
+        html = """<table class='label-sheet-table'>"""
 
         for row in range(sheet_layout.rows):
+            html += "<tr class='label-sheet-row'>"
+
             for col in range(sheet_layout.columns):
+                # Cell index
                 idx = row * sheet_layout.columns + col
 
                 if idx >= len(items):
                     break
 
-                html += (
-                    f"<div class='label-sheet-cell "
-                    f"label-sheet-row-{row} label-sheet-col-{col}'>"
-                )
+                html += f"<td class='label-sheet-cell label-sheet-row-{row} label-sheet-col-{col}'>"
 
+                # If the label is empty (skipped), render an empty cell
                 if items[idx] is None:
-                    html += "<div class='label-sheet-cell-skip'></div>"
+                    html += """<div class='label-sheet-cell-skip'></div>"""
                 else:
                     try:
+                        # Render the individual label template
+                        # Note that we disable @page styling for this
                         cell = label.render_as_string(
                             items[idx], request, insert_page_style=False
                         )
-                        cell = clean_embedded_label_html(cell)
+
+                        # Save exactly what InvenTree returned before the plugin
+                        # inserts or modifies the label HTML.
+                        if debug_dir is not None:
+                            debug_file = debug_dir / (
+                                f"sheet_label_page_{page_number:02d}_"
+                                f"cell_{idx + 1:02d}_raw.html"
+                            )
+                            debug_file.write_text(cell, encoding="utf-8")
+
                         html += cell
                     except Exception as exc:
                         _log.exception('Error rendering label: %s', str(exc))
-                        html += "<div class='label-sheet-cell-error'></div>"
-
+                        html += """
+                        <div class='label-sheet-cell-error'></div>
+                        """
+                
+                # overlay for border
                 html += "<div class='label-sheet-cell-overlay'></div>"
-                html += "</div>"
 
-        html += "</div>"
+                html += '</td>'
+
+            html += '</tr>'
+
+        html += '</table>'
+
         return html
-
 
     def wrap_pages(self, pages, enable_border: bool, fill_color: str, sheet_layout: SheetLayout):
         """Wrap the generated pages into a single document."""
@@ -415,18 +435,11 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                     padding: 0mm;
                 }}
 
-                .label-sheet-page {{
-                    position: relative;
-                    width: {sheet_layout.page_size.width}mm;
-                    height: {sheet_layout.page_size.height}mm;
-                    margin: 0mm;
-                    padding: 0mm;
+                .label-sheet-table {{
                     page-break-after: always;
-                    overflow: hidden;
-                }}
-
-                .label-sheet-page:last-child {{
-                    page-break-after: auto;
+                    table-layout: fixed;
+                    width: {sheet_layout.page_size.width}mm;
+                    border-spacing: 0mm 0mm;
                 }}
 
                 .label-sheet-cell-error {{
@@ -434,12 +447,10 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                 }}
 
                 .label-sheet-cell {{
-                    position: absolute;
                     width: {sheet_layout.label_width}mm;
                     height: {sheet_layout.label_height}mm;
-                    margin: 0mm;
                     padding: 0mm;
-                    overflow: hidden;
+                    position: absolute;
                     {'background-color: ' + fill_color + ';' if fill_color not in ["", "unset"] else ''};
                     border-radius: {sheet_layout.corner_radius}mm;
                 }}
@@ -465,30 +476,6 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         </head>
         <body>
             {inner}
-
-            <!-- Keep this final style block after all embedded label HTML.
-                 Individual label templates can contain their own @page rule;
-                 the last @page rule wins in WeasyPrint. -->
-            <style>
-                @page {{
-                    size: {sheet_layout.page_size.width}mm {sheet_layout.page_size.height}mm;
-                    margin: 0mm;
-                    padding: 0mm;
-                }}
-
-                html,
-                body {{
-                    width: {sheet_layout.page_size.width}mm !important;
-                    min-width: {sheet_layout.page_size.width}mm !important;
-                    max-width: {sheet_layout.page_size.width}mm !important;
-                    height: auto !important;
-                    min-height: {sheet_layout.page_size.height}mm !important;
-                    max-height: none !important;
-                    margin: 0mm !important;
-                    padding: 0mm !important;
-                    overflow: visible !important;
-                }}
-            </style>
         </body>
         </html>
         """
