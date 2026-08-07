@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from html.parser import HTMLParser
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -30,75 +31,140 @@ _log = logging.getLogger('inventree-adv-sheet-label')
 _plugin_instance: "AdvancedLabelSheetPlugin" = ...
 
 
-def prepare_embedded_label_html(html: str) -> str:
-    """Convert InvenTree's complete rendered label document into an embeddable fragment.
+class _RenderedLabelParser(HTMLParser):
+    """Extract <style> blocks and the contents of <body> from rendered label HTML."""
 
-    Current InvenTree versions return a complete HTML document from
-    LabelTemplate.render_as_string(), including <head>, <style>, <body> and
-    page-level CSS. The sheet printer must keep the label-specific CSS, but
-    must not embed nested document tags or allow the label's @page/body rules
-    to override the outer sheet.
-    """
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.styles = []
+        self.body_parts = []
+        self._in_style = False
+        self._in_body = False
+        self._style_parts = []
 
-    # Collect the CSS generated for the individual label.
-    styles = re.findall(
-        r"<style\b[^>]*>(.*?)</style>",
-        html,
+    @staticmethod
+    def _attrs(attrs):
+        if not attrs:
+            return ""
+        parts = []
+        for key, value in attrs:
+            if value is None:
+                parts.append(key)
+            else:
+                escaped = (
+                    str(value)
+                    .replace("&", "&amp;")
+                    .replace('"', "&quot;")
+                )
+                parts.append(f'{key}="{escaped}"')
+        return " " + " ".join(parts)
+
+    def handle_starttag(self, tag, attrs):
+        tag_l = tag.lower()
+
+        if tag_l == "style":
+            self._in_style = True
+            self._style_parts = []
+            return
+
+        if tag_l == "body":
+            self._in_body = True
+            return
+
+        if self._in_body:
+            self.body_parts.append(f"<{tag}{self._attrs(attrs)}>")
+
+    def handle_startendtag(self, tag, attrs):
+        if self._in_body:
+            self.body_parts.append(f"<{tag}{self._attrs(attrs)} />")
+
+    def handle_endtag(self, tag):
+        tag_l = tag.lower()
+
+        if tag_l == "style" and self._in_style:
+            self.styles.append("".join(self._style_parts))
+            self._style_parts = []
+            self._in_style = False
+            return
+
+        if tag_l == "body":
+            self._in_body = False
+            return
+
+        if self._in_body:
+            self.body_parts.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._in_style:
+            self._style_parts.append(data)
+        elif self._in_body:
+            self.body_parts.append(data)
+
+    def handle_entityref(self, name):
+        if self._in_body:
+            self.body_parts.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._in_body:
+            self.body_parts.append(f"&#{name};")
+
+    def handle_comment(self, data):
+        if self._in_body:
+            self.body_parts.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl):
+        # Doctype declarations are intentionally omitted from embedded labels.
+        pass
+
+
+def _clean_embedded_label_css(css: str) -> str:
+    """Remove standalone-page rules while preserving label-specific CSS."""
+
+    # Individual labels must not override the sheet page size.
+    css = re.sub(
+        r"@page\b[^{]*\{[^{}]*\}",
+        "",
+        css,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    cleaned_styles = []
-
-    for css in styles:
-        # The sheet itself owns the PDF page size.
-        css = re.sub(
-            r"@page\b[^{]*\{[^{}]*\}",
-            "",
-            css,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        # html/body selectors from a standalone label would affect the entire
-        # combined sheet document, so remove those rules completely.
-        css = re.sub(
-            r"(?<![-\w.#])(?:html\s*,\s*body|body\s*,\s*html|html|body)\s*\{[^{}]*\}",
-            "",
-            css,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-        # Standalone labels deliberately force page breaks. On a sheet these
-        # breaks must be suppressed.
-        css = re.sub(
-            r"(?:page-break-before|page-break-after|break-before|break-after)"
-            r"\s*:\s*[^;}{]+;?",
-            "",
-            css,
-            flags=re.IGNORECASE,
-        )
-
-        cleaned_styles.append(css)
-
-    # Keep only the contents of <body>; do not embed another <head>/<body>
-    # document inside the sheet document.
-    body_match = re.search(
-        r"<body\b[^>]*>(.*?)</body>",
-        html,
+    # Global html/body rules from a standalone label apply to the entire sheet
+    # when merged, so remove them. Label-specific classes remain untouched.
+    css = re.sub(
+        r"(?<![-\w.#])(?:html\s*,\s*body|body\s*,\s*html|html|body)\s*\{[^{}]*\}",
+        "",
+        css,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    if body_match:
-        body = body_match.group(1)
-    else:
-        # Fallback for older InvenTree versions which may already return a
-        # fragment rather than a complete document.
+    # Suppress forced page breaks inherited from the standalone label wrapper.
+    css = re.sub(
+        r"(?:page-break-before|page-break-after|break-before|break-after)"
+        r"\s*:\s*[^;}{]+;?",
+        "",
+        css,
+        flags=re.IGNORECASE,
+    )
+
+    return css
+
+
+def parse_rendered_label(html: str) -> tuple[str, str]:
+    """Return (clean_css, body_fragment) for an InvenTree-rendered label."""
+
+    parser = _RenderedLabelParser()
+    parser.feed(html)
+    parser.close()
+
+    css = "\n".join(_clean_embedded_label_css(s) for s in parser.styles)
+    body = "".join(parser.body_parts).strip()
+
+    # Compatibility fallback for older InvenTree releases which may already
+    # return an HTML fragment rather than a complete document.
+    if not body:
         body = html
 
-    css_block = ""
-    if cleaned_styles:
-        css_block = "<style>" + "\n".join(cleaned_styles) + "</style>"
-
-    return css_block + body
+    return css, body
 
 
 
@@ -351,10 +417,19 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
 
         # generate all pages
         pages = []
+
+        # CSS extracted from the rendered label template. Each selected item
+        # normally uses the same template CSS, so de-duplicate identical blocks.
+        label_styles: list[str] = []
+
         idx = 0
         while idx < len(items):
             if page := self.print_page(
-                label, items[idx : idx + sheet_layout.cells], request, sheet_layout
+                label,
+                items[idx : idx + sheet_layout.cells],
+                request,
+                sheet_layout,
+                label_styles,
             ):
                 pages.append(page)
 
@@ -364,7 +439,13 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
             raise ValidationError(_('No labels were generated'))
 
         # render to a single HTML document
-        html_data = self.wrap_pages(pages, border, fill_color, sheet_layout)
+        html_data = self.wrap_pages(
+            pages,
+            border,
+            fill_color,
+            sheet_layout,
+            label_styles,
+        )
 
         # render HTML to PDF
         html = weasyprint.HTML(string=html_data)
@@ -373,7 +454,14 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
             raise RuntimeError("Label PDF generation failed")
         return data
 
-    def print_page(self, label: LabelTemplate, items: list, request, sheet_layout: SheetLayout):
+    def print_page(
+        self,
+        label: LabelTemplate,
+        items: list,
+        request,
+        sheet_layout: SheetLayout,
+        label_styles: list[str],
+    ):
         """Generate a single page of labels.
 
         For a single page, generate a table grid of labels.
@@ -408,14 +496,14 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                     try:
                         # Render the individual label template
                         # Note that we disable @page styling for this
-                        cell = label.render_as_string(
+                        rendered = label.render_as_string(
                             items[idx], request, insert_page_style=False
                         )
 
-                        # Current InvenTree returns a complete HTML document.
-                        # Convert it to a safe fragment before inserting it
-                        # into the larger sheet document.
-                        cell = prepare_embedded_label_html(cell)
+                        css, cell = parse_rendered_label(rendered)
+
+                        if css and css not in label_styles:
+                            label_styles.append(css)
 
                         html += cell
                     except Exception as exc:
@@ -435,7 +523,14 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
 
         return html
 
-    def wrap_pages(self, pages, enable_border: bool, fill_color: str, sheet_layout: SheetLayout):
+    def wrap_pages(
+        self,
+        pages,
+        enable_border: bool,
+        fill_color: str,
+        sheet_layout: SheetLayout,
+        label_styles: list[str],
+    ):
         """Wrap the generated pages into a single document."""
 
         inner = ''.join(pages)
@@ -505,6 +600,9 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                 }}
 
                 {cell_styles}
+
+                /* CSS extracted from the individual InvenTree label template. */
+                {"".join(label_styles)}
 
                 body {{
                     margin: 0mm !important;
