@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-from html.parser import HTMLParser
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -31,96 +30,9 @@ _log = logging.getLogger('inventree-adv-sheet-label')
 _plugin_instance: "AdvancedLabelSheetPlugin" = ...
 
 
-class _RenderedLabelParser(HTMLParser):
-    """Extract <style> blocks and the contents of <body> from rendered label HTML."""
+def _clean_label_css(css: str) -> str:
+    """Prepare standalone InvenTree label CSS for use inside a sheet cell."""
 
-    def __init__(self):
-        super().__init__(convert_charrefs=False)
-        self.styles = []
-        self.body_parts = []
-        self._in_style = False
-        self._in_body = False
-        self._style_parts = []
-
-    @staticmethod
-    def _attrs(attrs):
-        if not attrs:
-            return ""
-        parts = []
-        for key, value in attrs:
-            if value is None:
-                parts.append(key)
-            else:
-                escaped = (
-                    str(value)
-                    .replace("&", "&amp;")
-                    .replace('"', "&quot;")
-                )
-                parts.append(f'{key}="{escaped}"')
-        return " " + " ".join(parts)
-
-    def handle_starttag(self, tag, attrs):
-        tag_l = tag.lower()
-
-        if tag_l == "style":
-            self._in_style = True
-            self._style_parts = []
-            return
-
-        if tag_l == "body":
-            self._in_body = True
-            return
-
-        if self._in_body:
-            self.body_parts.append(f"<{tag}{self._attrs(attrs)}>")
-
-    def handle_startendtag(self, tag, attrs):
-        if self._in_body:
-            self.body_parts.append(f"<{tag}{self._attrs(attrs)} />")
-
-    def handle_endtag(self, tag):
-        tag_l = tag.lower()
-
-        if tag_l == "style" and self._in_style:
-            self.styles.append("".join(self._style_parts))
-            self._style_parts = []
-            self._in_style = False
-            return
-
-        if tag_l == "body":
-            self._in_body = False
-            return
-
-        if self._in_body:
-            self.body_parts.append(f"</{tag}>")
-
-    def handle_data(self, data):
-        if self._in_style:
-            self._style_parts.append(data)
-        elif self._in_body:
-            self.body_parts.append(data)
-
-    def handle_entityref(self, name):
-        if self._in_body:
-            self.body_parts.append(f"&{name};")
-
-    def handle_charref(self, name):
-        if self._in_body:
-            self.body_parts.append(f"&#{name};")
-
-    def handle_comment(self, data):
-        if self._in_body:
-            self.body_parts.append(f"<!--{data}-->")
-
-    def handle_decl(self, decl):
-        # Doctype declarations are intentionally omitted from embedded labels.
-        pass
-
-
-def _clean_embedded_label_css(css: str) -> str:
-    """Remove standalone-page rules while preserving label-specific CSS."""
-
-    # Individual labels must not override the sheet page size.
     css = re.sub(
         r"@page\b[^{]*\{[^{}]*\}",
         "",
@@ -128,16 +40,56 @@ def _clean_embedded_label_css(css: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # Global html/body rules from a standalone label apply to the entire sheet
-    # when merged, so remove them. Label-specific classes remain untouched.
     css = re.sub(
-        r"(?<![-\w.#])(?:html\s*,\s*body|body\s*,\s*html|html|body)\s*\{[^{}]*\}",
+        r"html\s*,\s*body\s*\{[^{}]*\}",
+        "",
+        css,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    css = re.sub(
+        r"body\s*,\s*html\s*\{[^{}]*\}",
+        "",
+        css,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    css = re.sub(
+        r"html\s*\{[^{}]*\}",
         "",
         css,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # Suppress forced page breaks inherited from the standalone label wrapper.
+    def _scope_body_rule(match):
+        declarations = match.group(1)
+        declarations = re.sub(
+            r"(?:page-break-before|page-break-after|break-before|break-after)"
+            r"\s*:\s*[^;}{]+;?",
+            "",
+            declarations,
+            flags=re.IGNORECASE,
+        )
+        declarations = re.sub(
+            r"(?:width|height|min-width|max-width|min-height|max-height)"
+            r"\s*:\s*[^;}{]+;?",
+            "",
+            declarations,
+            flags=re.IGNORECASE,
+        )
+        declarations = re.sub(
+            r"(?:margin|padding)\s*:\s*[^;}{]+;?",
+            "",
+            declarations,
+            flags=re.IGNORECASE,
+        )
+        return ".label-sheet-cell {" + declarations + "}"
+
+    css = re.sub(
+        r"(?<![-\w.#])body\s*\{([^{}]*)\}",
+        _scope_body_rule,
+        css,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
     css = re.sub(
         r"(?:page-break-before|page-break-after|break-before|break-after)"
         r"\s*:\s*[^;}{]+;?",
@@ -149,22 +101,29 @@ def _clean_embedded_label_css(css: str) -> str:
     return css
 
 
-def parse_rendered_label(html: str) -> tuple[str, str]:
-    """Return (clean_css, body_fragment) for an InvenTree-rendered label."""
+def _extract_rendered_label(rendered: str) -> tuple[str, str]:
+    """Return (css, body_fragment) from LabelTemplate.render_as_string()."""
 
-    parser = _RenderedLabelParser()
-    parser.feed(html)
-    parser.close()
+    style_blocks = re.findall(
+        r"<style\b[^>]*>(.*?)</style>",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-    css = "\n".join(_clean_embedded_label_css(s) for s in parser.styles)
-    body = "".join(parser.body_parts).strip()
+    css = "\n".join(_clean_label_css(block) for block in style_blocks)
 
-    # Compatibility fallback for older InvenTree releases which may already
-    # return an HTML fragment rather than a complete document.
-    if not body:
-        body = html
+    body_match = re.search(
+        r"<body\b[^>]*>(.*?)</body>",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-    return css, body
+    if body_match:
+        body_fragment = body_match.group(1).strip()
+    else:
+        body_fragment = rendered.strip()
+
+    return css, body_fragment
 
 
 
@@ -418,8 +377,8 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         # generate all pages
         pages = []
 
-        # CSS extracted from the rendered label template. Each selected item
-        # normally uses the same template CSS, so de-duplicate identical blocks.
+        # CSS extracted from the rendered label template is emitted once in
+        # the outer sheet <head>.
         label_styles: list[str] = []
 
         idx = 0
@@ -462,65 +421,46 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         sheet_layout: SheetLayout,
         label_styles: list[str],
     ):
-        """Generate a single page of labels.
+        """Generate one physical sheet page using positioned DIV cells."""
 
-        For a single page, generate a table grid of labels.
-        Styling of the table is handled by the higher level label template
-
-        Arguments:
-            label: The LabelTemplate object to use for printing
-            items: The list of database items to print (e.g. StockItem instances)
-            request: The HTTP request object which triggered this print job
-            sheet_layout: the layout information of a page
-        """
-
-        # Generate a table of labels
-        html = """<table class='label-sheet-table'>"""
+        html = "<div class='label-sheet-page'>"
 
         for row in range(sheet_layout.rows):
-            html += "<tr class='label-sheet-row'>"
-
             for col in range(sheet_layout.columns):
-                # Cell index
                 idx = row * sheet_layout.columns + col
 
                 if idx >= len(items):
                     break
 
-                html += f"<td class='label-sheet-cell label-sheet-row-{row} label-sheet-col-{col}'>"
+                html += (
+                    f"<div class='label-sheet-cell "
+                    f"label-sheet-row-{row} label-sheet-col-{col}'>"
+                )
 
-                # If the label is empty (skipped), render an empty cell
                 if items[idx] is None:
-                    html += """<div class='label-sheet-cell-skip'></div>"""
+                    html += "<div class='label-sheet-cell-skip'></div>"
                 else:
                     try:
-                        # Render the individual label template
-                        # Note that we disable @page styling for this
                         rendered = label.render_as_string(
-                            items[idx], request, insert_page_style=False
+                            items[idx],
+                            request,
+                            insert_page_style=False,
                         )
 
-                        css, cell = parse_rendered_label(rendered)
+                        css, fragment = _extract_rendered_label(rendered)
 
                         if css and css not in label_styles:
                             label_styles.append(css)
 
-                        html += cell
+                        html += fragment
                     except Exception as exc:
                         _log.exception('Error rendering label: %s', str(exc))
-                        html += """
-                        <div class='label-sheet-cell-error'></div>
-                        """
-                
-                # overlay for border
+                        html += "<div class='label-sheet-cell-error'></div>"
+
                 html += "<div class='label-sheet-cell-overlay'></div>"
+                html += "</div>"
 
-                html += '</td>'
-
-            html += '</tr>'
-
-        html += '</table>'
-
+        html += "</div>"
         return html
 
     def wrap_pages(
@@ -531,86 +471,108 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         sheet_layout: SheetLayout,
         label_styles: list[str],
     ):
-        """Wrap the generated pages into a single document."""
+        """Wrap all generated sheet pages into one valid HTML document."""
 
         inner = ''.join(pages)
 
-        # Generate styles for individual cells (on each page)
         cell_styles = []
 
         for row in range(sheet_layout.rows):
             cell_styles.append(
                 f"""
-            .label-sheet-row-{row} {{
-                top: {sheet_layout.row_position_top(row)}mm;
-            }}
-            """
+                .label-sheet-row-{row} {{
+                    top: {sheet_layout.row_position_top(row)}mm;
+                }}
+                """
             )
 
         for col in range(sheet_layout.columns):
             cell_styles.append(
                 f"""
-            .label-sheet-col-{col} {{
-                left: {sheet_layout.column_position_left(col)}mm;
-            }}
-            """
+                .label-sheet-col-{col} {{
+                    left: {sheet_layout.column_position_left(col)}mm;
+                }}
+                """
             )
 
-        cell_styles = '\n'.join(cell_styles)
+        cell_styles = "\n".join(cell_styles)
+        embedded_label_css = "\n".join(label_styles)
 
-        return f"""
-        <head>
-            <style>
-                @page {{
-                    size: {sheet_layout.page_size.width}mm {sheet_layout.page_size.height}mm;
-                    margin: 0mm;
-                    padding: 0mm;
-                }}
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        @page {{
+            size: {sheet_layout.page_size.width}mm {sheet_layout.page_size.height}mm;
+            margin: 0mm;
+            padding: 0mm;
+        }}
 
-                .label-sheet-table {{
-                    page-break-after: always;
-                    table-layout: fixed;
-                    width: {sheet_layout.page_size.width}mm;
-                    border-spacing: 0mm 0mm;
-                }}
+        html,
+        body {{
+            margin: 0mm;
+            padding: 0mm;
+        }}
 
-                .label-sheet-cell-error {{
-                    background-color: #F00;
-                }}
+        .label-sheet-page {{
+            position: relative;
+            width: {sheet_layout.page_size.width}mm;
+            height: {sheet_layout.page_size.height}mm;
+            margin: 0mm;
+            padding: 0mm;
+            page-break-after: always;
+            overflow: hidden;
+        }}
 
-                .label-sheet-cell {{
-                    width: {sheet_layout.label_width}mm;
-                    height: {sheet_layout.label_height}mm;
-                    padding: 0mm;
-                    position: absolute;
-                    {'background-color: ' + fill_color + ';' if fill_color not in ["", "unset"] else ''};
-                    border-radius: {sheet_layout.corner_radius}mm;
-                }}
+        .label-sheet-page:last-child {{
+            page-break-after: auto;
+        }}
 
-                .label-sheet-cell-overlay {{
-                    border: {'0.25mm solid #000' if enable_border else '0mm'};
-                    border-radius: {sheet_layout.corner_radius}mm;
-                    box-sizing: border-box;
-                    width: {sheet_layout.label_width}mm;
-                    height: {sheet_layout.label_height}mm;
-                    padding: 0mm;
-                    position: absolute;
-                    top: 0px;
-                    left: 0px;
-                }}
+        .label-sheet-cell {{
+            position: absolute;
+            width: {sheet_layout.label_width}mm;
+            height: {sheet_layout.label_height}mm;
+            margin: 0mm;
+            padding: 0mm;
+            overflow: hidden;
+            border-radius: {sheet_layout.corner_radius}mm;
+            {'background-color: ' + fill_color + ';' if fill_color not in ["", "unset"] else ''}
+        }}
 
-                {cell_styles}
+        .label-sheet-cell-error {{
+            width: 100%;
+            height: 100%;
+            background-color: #F00;
+        }}
 
-                /* CSS extracted from the individual InvenTree label template. */
-                {"".join(label_styles)}
+        .label-sheet-cell-skip {{
+            width: 100%;
+            height: 100%;
+        }}
 
-                body {{
-                    margin: 0mm !important;
-                }}
-            </style>
-        </head>
-        <body>
-            {inner}
-        </body>
-        </html>
-        """
+        .label-sheet-cell-overlay {{
+            position: absolute;
+            box-sizing: border-box;
+            width: {sheet_layout.label_width}mm;
+            height: {sheet_layout.label_height}mm;
+            padding: 0mm;
+            top: 0mm;
+            left: 0mm;
+            pointer-events: none;
+            border: {'0.25mm solid #000' if enable_border else '0mm'};
+            border-radius: {sheet_layout.corner_radius}mm;
+        }}
+
+        {cell_styles}
+
+        /* CSS extracted from the selected InvenTree label template. */
+        {embedded_label_css}
+    </style>
+</head>
+<body>
+    {inner}
+</body>
+</html>
+"""
+
