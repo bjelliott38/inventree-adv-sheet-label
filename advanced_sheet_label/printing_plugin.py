@@ -482,6 +482,7 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                     height: {sheet_layout.label_height}mm;
                     padding: 0mm;
                     position: absolute;
+                    overflow: hidden;
                     {'background-color: ' + fill_color + ';' if fill_color not in ["", "unset"] else ''};
                     border-radius: {sheet_layout.corner_radius}mm;
                 }}
