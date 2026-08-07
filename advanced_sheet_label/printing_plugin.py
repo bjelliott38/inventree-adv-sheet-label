@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
-from pathlib import Path
+import re
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -48,6 +48,72 @@ def get_default_skip() -> int:
     if _plugin_instance is not ...: 
         return _plugin_instance.label_skip_counter
     return 0
+
+
+def _prepare_label_fragment(rendered: str) -> str:
+    """Prepare a standalone InvenTree label document for embedding in a sheet.
+
+    Current InvenTree versions return a complete HTML document for each label.
+    Modern WeasyPrint versions can allow an inner @page rule / page-break rule
+    to override the outer sheet. Strip only those document-level rules and tags
+    while leaving the label's own CSS classes and markup intact.
+    """
+
+    # The outer sheet owns the PDF page size.
+    rendered = re.sub(
+        r"@page\b[^{]*\{[^{}]*\}",
+        "",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove document-level html/body sizing rules.
+    rendered = re.sub(
+        r"(?:html\s*,\s*body|body\s*,\s*html)\s*\{[^{}]*\}",
+        "",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    rendered = re.sub(
+        r"(?<![-\w.#])html\s*\{[^{}]*\}",
+        "",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    rendered = re.sub(
+        r"(?<![-\w.#])body\s*\{[^{}]*\}",
+        "",
+        rendered,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove forced pagination rules, especially InvenTree's
+    # .content { break-after: always; } declaration.
+    rendered = re.sub(
+        r"(?:page-break-before|page-break-after|break-before|break-after)"
+        r"\s*:\s*[^;}{]+;?",
+        "",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    # Do not nest complete HTML documents inside the sheet.
+    # Keep <style> tags and label markup unchanged.
+    rendered = re.sub(
+        r"<!doctype[^>]*>",
+        "",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+    rendered = re.sub(
+        r"</?(?:html|head|body)\b[^>]*>",
+        "",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    return rendered.strip()
+
 
 
 class AdvancedLabelPrintingOptionsSerializer(serializers.Serializer):
@@ -103,7 +169,7 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
     NAME = 'AdvancedLabelSheet'
     TITLE = 'Advanced Label Sheet Printer'
     DESCRIPTION = 'Arrays multiple labels onto single, standard layout label sheets with additional useful features'
-    VERSION = '1.4.0'
+    VERSION = '1.4.1'
     AUTHOR = 'InvenTree contributors & melektron'
 
     BLOCKING_PRINT = True
@@ -279,27 +345,10 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
 
         # generate all pages
         pages = []
-
-        # Debug output directory is inside the persistent InvenTree data volume.
-        debug_dir = Path("/home/inventree/data/plugin_debug")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-        # Remove stale files from the previous print attempt.
-        for old_debug_file in debug_dir.glob("sheet_label_*"):
-            try:
-                old_debug_file.unlink()
-            except OSError:
-                pass
-
         idx = 0
         while idx < len(items):
             if page := self.print_page(
-                label,
-                items[idx : idx + sheet_layout.cells],
-                request,
-                sheet_layout,
-                debug_dir=debug_dir,
-                page_number=(idx // sheet_layout.cells) + 1,
+                label, items[idx : idx + sheet_layout.cells], request, sheet_layout
             ):
                 pages.append(page)
 
@@ -311,12 +360,6 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
         # render to a single HTML document
         html_data = self.wrap_pages(pages, border, fill_color, sheet_layout)
 
-        # Save the complete assembled sheet HTML for troubleshooting.
-        (debug_dir / "sheet_label_complete_sheet.html").write_text(
-            html_data,
-            encoding="utf-8",
-        )
-
         # render HTML to PDF
         html = weasyprint.HTML(string=html_data)
         data = html.render().write_pdf()
@@ -324,15 +367,7 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
             raise RuntimeError("Label PDF generation failed")
         return data
 
-    def print_page(
-        self,
-        label: LabelTemplate,
-        items: list,
-        request,
-        sheet_layout: SheetLayout,
-        debug_dir: Path | None = None,
-        page_number: int = 1,
-    ):
+    def print_page(self, label: LabelTemplate, items: list, request, sheet_layout: SheetLayout):
         """Generate a single page of labels.
 
         For a single page, generate a table grid of labels.
@@ -371,14 +406,10 @@ class AdvancedLabelSheetPlugin(LabelPrintingMixin, SettingsMixin, InvenTreePlugi
                             items[idx], request, insert_page_style=False
                         )
 
-                        # Save exactly what InvenTree returned before the plugin
-                        # inserts or modifies the label HTML.
-                        if debug_dir is not None:
-                            debug_file = debug_dir / (
-                                f"sheet_label_page_{page_number:02d}_"
-                                f"cell_{idx + 1:02d}_raw.html"
-                            )
-                            debug_file.write_text(cell, encoding="utf-8")
+                        # Convert the complete standalone label document returned
+                        # by InvenTree into a safe fragment before embedding it
+                        # in the larger sheet document.
+                        cell = _prepare_label_fragment(cell)
 
                         html += cell
                     except Exception as exc:
